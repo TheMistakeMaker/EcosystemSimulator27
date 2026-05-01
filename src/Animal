@@ -1,0 +1,781 @@
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Random;
+
+public class Plant {
+    private static final Random rand = new Random();
+    private static int nextId = 1;
+
+    public enum SpreadMethod {
+        LOCAL_SEEDS,
+        WIND_SEEDS,
+        WATER_SEEDS
+    }
+
+    private final int id;
+    private final int generation;
+
+    private int parentId;
+    private int row;
+    private int col;
+
+    private String speciesName;
+    private SpreadMethod spreadMethod;
+
+    private boolean alive;
+    private int ageTicks;
+    private int reproductionCooldown;
+
+    private double health;
+    private double calories;
+    private double storedWater;
+    private double height;
+
+    private int mutationCount;
+    private String mutationSummary;
+
+    private Map<String, Double> genes;
+
+    public Plant(int row, int col, Map<String, Double> customGenes, String speciesName, int generation, SpreadMethod spreadMethod) {
+        this.id = nextId++;
+        this.row = row;
+        this.col = col;
+        this.speciesName = speciesName;
+        this.generation = generation;
+        this.spreadMethod = spreadMethod;
+        this.parentId = -1;
+
+        this.genes = new HashMap<>();
+        addDefaultGenes();
+
+        if (customGenes != null) {
+            this.genes.putAll(customGenes);
+        }
+
+        cleanAllGenes();
+
+        this.alive = true;
+        this.ageTicks = 0;
+        this.reproductionCooldown = 0;
+
+        this.health = getGene("maxHealth");
+        this.calories = getGene("startingCalories");
+        this.storedWater = getGene("maxWaterStorage") * getGene("startingWaterRatio");
+        this.height = getGene("startingHeight");
+
+        this.mutationCount = 0;
+        this.mutationSummary = "Founder plant";
+    }
+
+    public void update(World world) {
+        if (!alive) {
+            return;
+        }
+
+        ageTicks++;
+
+        if (reproductionCooldown > 0) {
+            reproductionCooldown--;
+        }
+
+        absorbWater(world);
+        photosynthesize(world);
+        payMaintenanceCosts();
+        handleCrowding(world);
+        handleAging();
+
+        if (health <= 0) {
+            die(world);
+            return;
+        }
+
+        chooseAction(world);
+
+        if (health <= 0) {
+            die(world);
+        }
+    }
+
+    private void chooseAction(World world) {
+        double waterRatio = storedWater / getGene("maxWaterStorage");
+        double calorieRatio = calories / getGene("maxCalories");
+        double healthRatio = health / getGene("maxHealth");
+        double heightRatio = height / getGene("maxHeight");
+
+        boolean criticallyStressed =
+                waterRatio < 0.15 ||
+                        calorieRatio < 0.10 ||
+                        healthRatio < 0.35;
+
+        boolean immature =
+                ageTicks < getGene("reproductionAgeTicks") ||
+                        height < getGene("seedHeightRequired");
+
+        if (criticallyStressed) {
+            conserveResources();
+            return;
+        }
+
+        if (immature) {
+            grow();
+            return;
+        }
+
+        double stress =
+                (1.0 - waterRatio) * 0.45
+                        + (1.0 - calorieRatio) * 0.30
+                        + (1.0 - healthRatio) * 0.25;
+
+        double growthScore =
+                getGene("growthPriority")
+                        * (1.0 - heightRatio)
+                        * calorieRatio
+                        * waterRatio;
+
+        double reproductionScore =
+                getGene("reproductionPriority")
+                        * heightRatio
+                        * calorieRatio
+                        * waterRatio
+                        * healthRatio;
+
+        double survivalScore = getGene("survivalPriority") * stress;
+        double repairScore = getGene("repairPriority") * (1.0 - healthRatio);
+
+        if (canReproduce() && reproductionScore >= growthScore) {
+            spreadSeeds(world);
+        } else if (repairScore > growthScore && repairScore > reproductionScore) {
+            repairDamage();
+        } else if (survivalScore > growthScore && survivalScore > reproductionScore) {
+            conserveResources();
+        } else {
+            grow();
+        }
+    }
+
+    private void absorbWater(World world) {
+        int searchRange = (int) Math.round(getGene("rootDepth"));
+        boolean nearWater = false;
+
+        for (int r = row - searchRange; r <= row + searchRange; r++) {
+            for (int c = col - searchRange; c <= col + searchRange; c++) {
+                if (world.isValidTile(r, c) && world.getTile(r, c) == World.TileType.WATER) {
+                    nearWater = true;
+                }
+            }
+        }
+
+        double absorbedWater;
+
+        if (nearWater) {
+            absorbedWater = getGene("waterAbsorptionRate") * getGene("rootDepth");
+        } else {
+            absorbedWater = getGene("waterAbsorptionRate") * getGene("drySoilWaterFactor");
+        }
+
+        storedWater += absorbedWater;
+
+        if (storedWater > getGene("maxWaterStorage")) {
+            storedWater = getGene("maxWaterStorage");
+        }
+    }
+
+    private void photosynthesize(World world) {
+        if (storedWater <= 0) {
+            health -= getGene("dehydrationDamage");
+            return;
+        }
+
+        double sun = world.getSunValue();
+        int nearbyPlants = world.countPlantsNear(row, col, 1);
+
+        double shadePenalty = nearbyPlants * getGene("lightCompetitionPenalty");
+        double heightAdvantage = 0.50 + height / getGene("maxHeight");
+
+        double localLight = sun * heightAdvantage - shadePenalty;
+        localLight = clamp(localLight, 0.0, 1.5);
+
+        double leafArea = getGene("leafArea");
+        double efficiency = getGene("photosynthesisEfficiency");
+
+        double caloriesMade =
+                getGene("photosynthesisRate")
+                        * localLight
+                        * leafArea
+                        * efficiency
+                        * Math.sqrt(height + 0.20);
+
+        double waterCost =
+                getGene("photosynthesisWaterCost")
+                        * leafArea
+                        * efficiency
+                        * Math.sqrt(height + 0.20);
+
+        calories += caloriesMade;
+        storedWater -= waterCost;
+
+        if (calories > getGene("maxCalories")) {
+            calories = getGene("maxCalories");
+        }
+
+        if (storedWater < 0) {
+            storedWater = 0;
+        }
+    }
+
+    private void payMaintenanceCosts() {
+        double efficiency = getGene("photosynthesisEfficiency");
+
+        double totalCost =
+                getGene("baseMetabolism")
+                        + height * getGene("heightMaintenanceCost")
+                        + getGene("leafArea") * getGene("leafMaintenanceCost")
+                        + getGene("rootDepth") * getGene("rootMaintenanceCost")
+                        + getGene("toxicity") * getGene("toxicityMaintenanceCost")
+                        + efficiency * efficiency * getGene("efficiencyMaintenanceCost");
+
+        calories -= totalCost;
+
+        if (calories <= 0) {
+            calories = 0;
+            health -= getGene("starvationDamage");
+        }
+    }
+
+    private void grow() {
+        if (height >= getGene("maxHeight")) {
+            return;
+        }
+
+        double calorieCost = getGene("growthCalorieCost");
+        double waterCost = getGene("growthWaterCost");
+
+        if (calories >= calorieCost && storedWater >= waterCost) {
+            calories -= calorieCost;
+            storedWater -= waterCost;
+
+            height += getGene("growthRate");
+
+            if (height > getGene("maxHeight")) {
+                height = getGene("maxHeight");
+            }
+        }
+    }
+
+    private void conserveResources() {
+        calories -= getGene("baseMetabolism") * 0.20;
+
+        if (calories < 0) {
+            calories = 0;
+        }
+    }
+
+    private void repairDamage() {
+        if (health >= getGene("maxHealth")) {
+            return;
+        }
+
+        double calorieCost = getGene("repairCalorieCost");
+        double waterCost = getGene("repairWaterCost");
+
+        if (calories >= calorieCost && storedWater >= waterCost) {
+            calories -= calorieCost;
+            storedWater -= waterCost;
+
+            health += getGene("repairRate");
+
+            if (health > getGene("maxHealth")) {
+                health = getGene("maxHealth");
+            }
+        }
+    }
+
+    private void handleCrowding(World world) {
+        int nearbyPlants = world.countPlantsNear(row, col, 1);
+
+        if (nearbyPlants > getGene("crowdingTolerance")) {
+            health -= (nearbyPlants - getGene("crowdingTolerance")) * getGene("crowdingDamage");
+        }
+    }
+
+    private void handleAging() {
+        if (ageTicks > getGene("maxAgeTicks")) {
+            health -= getGene("oldAgeDamage");
+        }
+    }
+
+    public boolean canReproduce() {
+        return alive
+                && ageTicks >= getGene("reproductionAgeTicks")
+                && reproductionCooldown <= 0
+                && calories >= getGene("seedCaloriesRequired")
+                && storedWater >= getGene("seedWaterRequired")
+                && health >= getGene("seedHealthRequired")
+                && height >= getGene("seedHeightRequired");
+    }
+
+    public void spreadSeeds(World world) {
+        int seedCount = (int) Math.round(getGene("seedCount"));
+
+        for (int i = 0; i < seedCount; i++) {
+            int[] target = findSeedTarget(world);
+
+            if (target != null) {
+                Map<String, Double> childGenes = createMutatedGenes();
+                SpreadMethod childSpreadMethod = mutateSpreadMethod();
+
+                Plant child = new Plant(
+                        target[0],
+                        target[1],
+                        childGenes,
+                        speciesName,
+                        generation + 1,
+                        childSpreadMethod
+                );
+
+                child.parentId = this.id;
+                child.setMutationRecordFromParent(this);
+
+                world.addPlant(child);
+            }
+        }
+
+        calories -= getGene("seedCalorieCost");
+        storedWater -= getGene("seedWaterCost");
+
+        if (calories < 0) {
+            calories = 0;
+        }
+
+        if (storedWater < 0) {
+            storedWater = 0;
+        }
+
+        reproductionCooldown = (int) Math.round(getGene("reproductionCooldownTicks"));
+    }
+
+    private int[] findSeedTarget(World world) {
+        int spreadDistance = (int) Math.round(getGene("seedSpreadDistance"));
+
+        if (spreadMethod == SpreadMethod.LOCAL_SEEDS) {
+            return world.findOpenPlantTileNear(row, col, spreadDistance);
+        }
+
+        if (spreadMethod == SpreadMethod.WIND_SEEDS) {
+            return world.findOpenPlantTileNear(row, col, spreadDistance * 2);
+        }
+
+        if (spreadMethod == SpreadMethod.WATER_SEEDS) {
+            int[] waterTarget = world.findOpenPlantTileNearWater(row, col, spreadDistance * 2);
+
+            if (waterTarget != null) {
+                return waterTarget;
+            }
+
+            return world.findOpenPlantTileNear(row, col, spreadDistance);
+        }
+
+        return null;
+    }
+
+    public double beEaten(double requestedCalories, Animal eater, World world) {
+        if (!alive) {
+            return 0;
+        }
+
+        double eatenCalories = Math.min(requestedCalories, calories);
+        calories -= eatenCalories;
+
+        double actualCalories = eatenCalories * getGene("nutritionMultiplier");
+
+        if (eater != null && getGene("toxicity") > 0 && world != null) {
+            eater.takeDamage(getGene("toxicity"), world);
+        }
+
+        health -= eatenCalories * getGene("eatingDamageMultiplier");
+
+        if (calories <= 0 || health <= 0) {
+            alive = false;
+        }
+
+        return actualCalories;
+    }
+
+    public double beEaten(double requestedCalories, Animal eater) {
+        return beEaten(requestedCalories, eater, null);
+    }
+
+    private Map<String, Double> createMutatedGenes() {
+        Map<String, Double> childGenes = new HashMap<>();
+
+        double mutationRate = getGene("mutationRate");
+        double mutationStrength = getGene("mutationStrength");
+
+        String[] geneNames = genes.keySet().toArray(new String[0]);
+        int mutationsMade = 0;
+
+        for (String geneName : geneNames) {
+            double value = genes.get(geneName);
+
+            if (rand.nextDouble() < mutationRate) {
+                value = mutateOneGene(value, mutationStrength);
+                mutationsMade++;
+            }
+
+            childGenes.put(geneName, cleanGeneValue(geneName, value));
+        }
+
+        if (mutationsMade == 0 && geneNames.length > 0) {
+            String forcedGene = geneNames[rand.nextInt(geneNames.length)];
+            double oldValue = genes.get(forcedGene);
+            double newValue = mutateOneGene(oldValue, mutationStrength);
+            childGenes.put(forcedGene, cleanGeneValue(forcedGene, newValue));
+        }
+
+        return childGenes;
+    }
+
+    private double mutateOneGene(double originalValue, double mutationStrength) {
+        double minimumVisibleChange = 0.04;
+        double changeAmount = minimumVisibleChange + rand.nextDouble() * mutationStrength;
+
+        if (rand.nextBoolean()) {
+            changeAmount *= -1;
+        }
+
+        return originalValue * (1.0 + changeAmount);
+    }
+
+    private SpreadMethod mutateSpreadMethod() {
+        if (rand.nextDouble() > getGene("spreadMethodMutationRate")) {
+            return spreadMethod;
+        }
+
+        SpreadMethod[] methods = SpreadMethod.values();
+        return methods[rand.nextInt(methods.length)];
+    }
+
+    private void setMutationRecordFromParent(Plant parent) {
+        int count = 0;
+        String summary = "";
+
+        for (String geneName : genes.keySet()) {
+            if (parent.genes.containsKey(geneName)) {
+                double parentValue = parent.genes.get(geneName);
+                double childValue = genes.get(geneName);
+
+                double difference = Math.abs(parentValue - childValue);
+
+                if (difference > 0.0001) {
+                    count++;
+
+                    if (count <= 10) {
+                        summary += geneName
+                                + ": "
+                                + format(parentValue)
+                                + " -> "
+                                + format(childValue)
+                                + "; ";
+                    }
+                }
+            }
+        }
+
+        if (this.spreadMethod != parent.spreadMethod) {
+            count++;
+            summary += "spreadMethod: " + parent.spreadMethod + " -> " + this.spreadMethod + "; ";
+        }
+
+        this.mutationCount = count;
+
+        if (count == 0) {
+            this.mutationSummary = "No visible mutation";
+        } else {
+            this.mutationSummary = summary;
+        }
+    }
+
+    private void die(World world) {
+        alive = false;
+
+        if (world != null) {
+            world.removePlant(this);
+        }
+    }
+
+    public Map<String, String> getInspectionData() {
+        Map<String, String> data = new LinkedHashMap<>();
+
+        data.put("ID", String.valueOf(id));
+        data.put("Species", speciesName);
+        data.put("Generation", String.valueOf(generation));
+        data.put("Parent ID", String.valueOf(parentId));
+        data.put("Position", "(" + row + ", " + col + ")");
+        data.put("Alive", String.valueOf(alive));
+        data.put("Age", String.valueOf(ageTicks));
+        data.put("Spread Method", spreadMethod.toString());
+        data.put("Health", format(health) + " / " + format(getGene("maxHealth")));
+        data.put("Calories", format(calories) + " / " + format(getGene("maxCalories")));
+        data.put("Stored Water", format(storedWater) + " / " + format(getGene("maxWaterStorage")));
+        data.put("Height", format(height) + " / " + format(getGene("maxHeight")));
+        data.put("Reproduction Ready", String.valueOf(canReproduce()));
+        data.put("Growth Score", format(calculateGrowthScore()));
+        data.put("Reproduction Score", format(calculateReproductionScore()));
+        data.put("Tradeoff Burden", format(calculateTradeoffBurden()));
+        data.put("Mutation Count", String.valueOf(mutationCount));
+        data.put("Mutation Summary", mutationSummary);
+
+        for (String geneName : genes.keySet()) {
+            data.put("Gene: " + geneName, format(genes.get(geneName)));
+        }
+
+        return data;
+    }
+
+    private double calculateGrowthScore() {
+        double waterRatio = storedWater / getGene("maxWaterStorage");
+        double calorieRatio = calories / getGene("maxCalories");
+        double heightRatio = height / getGene("maxHeight");
+
+        return getGene("growthPriority")
+                * (1.0 - heightRatio)
+                * calorieRatio
+                * waterRatio;
+    }
+
+    private double calculateReproductionScore() {
+        double waterRatio = storedWater / getGene("maxWaterStorage");
+        double calorieRatio = calories / getGene("maxCalories");
+        double healthRatio = health / getGene("maxHealth");
+        double heightRatio = height / getGene("maxHeight");
+
+        return getGene("reproductionPriority")
+                * heightRatio
+                * calorieRatio
+                * waterRatio
+                * healthRatio;
+    }
+
+    private double calculateTradeoffBurden() {
+        double efficiency = getGene("photosynthesisEfficiency");
+
+        return efficiency * efficiency * getGene("efficiencyMaintenanceCost")
+                + getGene("leafArea") * getGene("leafMaintenanceCost")
+                + getGene("rootDepth") * getGene("rootMaintenanceCost")
+                + getGene("toxicity") * getGene("toxicityMaintenanceCost");
+    }
+
+    private void addDefaultGenes() {
+        genes.put("maxHealth", 80.0);
+        genes.put("maxCalories", 120.0);
+        genes.put("maxWaterStorage", 100.0);
+
+        genes.put("startingCalories", 35.0);
+        genes.put("startingWaterRatio", 0.55);
+        genes.put("startingHeight", 0.25);
+
+        genes.put("maxHeight", 5.0);
+        genes.put("growthRate", 0.035);
+        genes.put("growthCalorieCost", 1.6);
+        genes.put("growthWaterCost", 0.9);
+        genes.put("leafArea", 1.0);
+        genes.put("rootDepth", 2.0);
+
+        genes.put("photosynthesisRate", 0.85);
+        genes.put("photosynthesisEfficiency", 1.0);
+        genes.put("photosynthesisWaterCost", 0.18);
+
+        genes.put("waterAbsorptionRate", 1.15);
+        genes.put("drySoilWaterFactor", 0.22);
+
+        genes.put("baseMetabolism", 0.12);
+        genes.put("heightMaintenanceCost", 0.07);
+        genes.put("leafMaintenanceCost", 0.09);
+        genes.put("rootMaintenanceCost", 0.06);
+        genes.put("efficiencyMaintenanceCost", 0.10);
+
+        genes.put("lightCompetitionPenalty", 0.12);
+        genes.put("crowdingTolerance", 3.0);
+        genes.put("crowdingDamage", 0.30);
+
+        genes.put("toxicity", 0.0);
+        genes.put("toxicityMaintenanceCost", 0.03);
+        genes.put("nutritionMultiplier", 1.0);
+        genes.put("eatingDamageMultiplier", 0.20);
+
+        genes.put("starvationDamage", 0.55);
+        genes.put("dehydrationDamage", 0.85);
+        genes.put("oldAgeDamage", 0.20);
+        genes.put("maxAgeTicks", 3000.0);
+
+        genes.put("repairRate", 0.30);
+        genes.put("repairCalorieCost", 1.0);
+        genes.put("repairWaterCost", 0.6);
+
+        genes.put("reproductionAgeTicks", 120.0);
+        genes.put("reproductionCooldownTicks", 160.0);
+        genes.put("seedCaloriesRequired", 75.0);
+        genes.put("seedWaterRequired", 25.0);
+        genes.put("seedHealthRequired", 50.0);
+        genes.put("seedHeightRequired", 1.6);
+
+        genes.put("seedCount", 2.0);
+        genes.put("seedSpreadDistance", 3.0);
+        genes.put("seedCalorieCost", 35.0);
+        genes.put("seedWaterCost", 14.0);
+
+        genes.put("growthPriority", 0.55);
+        genes.put("reproductionPriority", 0.38);
+        genes.put("survivalPriority", 0.70);
+        genes.put("repairPriority", 0.20);
+
+        genes.put("mutationRate", 0.15);
+        genes.put("mutationStrength", 0.18);
+        genes.put("spreadMethodMutationRate", 0.03);
+    }
+
+    private void cleanAllGenes() {
+        for (String geneName : genes.keySet()) {
+            genes.put(geneName, cleanGeneValue(geneName, genes.get(geneName)));
+        }
+    }
+
+    private double cleanGeneValue(String geneName, double value) {
+        if (Double.isNaN(value) || Double.isInfinite(value)) {
+            value = 1.0;
+        }
+
+        value = Math.max(0.001, value);
+
+        if (geneName.equals("startingWaterRatio")
+                || geneName.equals("nutritionMultiplier")) {
+            value = clamp(value, 0.0, 1.0);
+        }
+
+        if (geneName.equals("mutationRate")
+                || geneName.equals("mutationStrength")
+                || geneName.equals("spreadMethodMutationRate")) {
+            value = clamp(value, 0.001, 0.60);
+        }
+
+        if (geneName.equals("photosynthesisEfficiency")) {
+            value = clamp(value, 0.25, 2.25);
+        }
+
+        if (geneName.equals("leafArea")) {
+            value = clamp(value, 0.30, 4.0);
+        }
+
+        if (geneName.equals("rootDepth")) {
+            value = clamp(value, 0.50, 6.0);
+        }
+
+        if (geneName.equals("toxicity")) {
+            value = clamp(value, 0.0, 35.0);
+        }
+
+        if (geneName.equals("growthPriority")
+                || geneName.equals("reproductionPriority")
+                || geneName.equals("survivalPriority")
+                || geneName.equals("repairPriority")) {
+            value = clamp(value, 0.05, 1.5);
+        }
+
+        if (geneName.equals("seedCount")) {
+            value = clamp(value, 1.0, 5.0);
+        }
+
+        if (geneName.equals("seedSpreadDistance")) {
+            value = clamp(value, 1.0, 8.0);
+        }
+
+        if (geneName.equals("maxHeight")) {
+            value = clamp(value, 1.0, 12.0);
+        }
+
+        if (geneName.equals("maxCalories")
+                || geneName.equals("maxWaterStorage")
+                || geneName.equals("maxHealth")) {
+            value = clamp(value, 10.0, 500.0);
+        }
+
+        return value;
+    }
+
+    private double clamp(double value, double min, double max) {
+        return Math.max(min, Math.min(max, value));
+    }
+
+    private String format(double value) {
+        return String.format("%.4f", value);
+    }
+
+    public int getId() {
+        return id;
+    }
+
+    public int getGeneration() {
+        return generation;
+    }
+
+    public int getParentId() {
+        return parentId;
+    }
+
+    public String getSpeciesName() {
+        return speciesName;
+    }
+
+    public SpreadMethod getSpreadMethod() {
+        return spreadMethod;
+    }
+
+    public boolean isAlive() {
+        return alive;
+    }
+
+    public int getAgeTicks() {
+        return ageTicks;
+    }
+
+    public int getReproductionCooldown() {
+        return reproductionCooldown;
+    }
+
+    public int getRow() {
+        return row;
+    }
+
+    public int getCol() {
+        return col;
+    }
+
+    public double getHealth() {
+        return health;
+    }
+
+    public double getCalories() {
+        return calories;
+    }
+
+    public double getStoredWater() {
+        return storedWater;
+    }
+
+    public double getHeight() {
+        return height;
+    }
+
+    public double getGene(String geneName) {
+        if (!genes.containsKey(geneName)) {
+            throw new IllegalArgumentException("Missing plant gene: " + geneName);
+        }
+
+        return genes.get(geneName);
+    }
+
+    public Map<String, Double> getGenes() {
+        return new HashMap<>(genes);
+    }
+}
