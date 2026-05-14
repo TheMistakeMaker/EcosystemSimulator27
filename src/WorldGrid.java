@@ -4,9 +4,6 @@ public class WorldGrid {
     private final Tile[][] tiles;
 
     public WorldGrid(int rows, int cols) {
-        if (rows <= 0 || cols <= 0) {
-            throw new IllegalArgumentException("World dimensions must be positive");
-        }
 
         this.rows = rows;
         this.cols = cols;
